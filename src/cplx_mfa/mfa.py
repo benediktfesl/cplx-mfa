@@ -1,340 +1,589 @@
-# Original code base:
-# Authors: Ross Fadely, Daniel Foreman-Mackey, David W. Hogg, and contributors.
-# License: MIT
+"""Complex-valued mixture of factor analyzers."""
 
-# Contributions with considerable memory savings, complexity speed-ups, and complex-valued extension:
-# Author: Benedikt Fesl <benedikt.fesl@tum.de>
-# License: BSD 3 clause
+from __future__ import annotations
+
+import warnings
 
 import numpy as np
 from scipy.linalg import inv
 from sklearn import cluster
+
 from . import utils as ut
 
 
 class ComplexMFA:
+    """Complex-valued mixture of factor analyzers.
+
+    Parameters
+    ----------
+    n_components : int
+        Number of mixture components.
+    latent_dim : int
+        Latent dimensionality of each factor analyzer.
+    ppca : bool, default=False
+        If True, use an isotropic diagonal covariance per component.
+    lock_psis : bool, default=False
+        If True, use a shared diagonal covariance across components.
+    rs_clip : float, default=0.0
+        Lower clipping value for responsibilities during EM.
+    max_condition_number : float, default=1e6
+        Scaling factor used for random loading initialization.
+    max_iter : int, default=100
+        Maximum number of EM iterations.
+    tol : float, default=1e-4
+        Relative convergence tolerance for the EM lower bound.
+    random_state : int, numpy.random.Generator, or None, default=None
+        Random seed or random number generator used for initialization.
+    verbose : bool, default=True
+        If True, print EM progress.
+
+    Attributes
+    ----------
+    means_ : ndarray of shape (n_components, n_features)
+        Fitted component means.
+    loadings_ : ndarray of shape (n_components, n_features, latent_dim)
+        Fitted factor loading matrices.
+    covariances_ : ndarray of shape (n_components, n_features, n_features)
+        Fitted component covariance matrices.
+    precisions_ : ndarray of shape (n_components, n_features, n_features)
+        Inverse component covariance matrices.
+    noise_variances_ : ndarray of shape (n_components, n_features)
+        Fitted diagonal noise variances.
+    weights_ : ndarray of shape (n_components,)
+        Fitted mixture weights.
+    lower_bound_history_ : list of float
+        EM lower-bound values collected during fitting.
     """
-    Complex-valued implementation of the EM algorithm for fitting Mixture of Factor Analyzers.
 
-    internal variables:
-    `K`:           Number of components
-    `M`:           Latent dimensionality
-    `D`:           Data dimensionality
-    `N`:           Number of data points
-    `data`:        (N,D) array of observations
-    `latents`:     (K,M,N) array of latent variables
-    `latent_covs`: (K,M,M,N) array of latent covariances
-    `lambdas`:     (K,M,D) array of loadings
-    `psis`:        (K,D) array of diagonal variance values
-    `rs`:          (K,N) array of responsibilities
-    `amps`:        (K) array of component amplitudes
-    maxiter:
-        The maximum number of iterations to try.
-    tol:
-        The tolerance on the relative change in the loss function that
-        controls convergence.
-    verbose:
-        Print all the messages?
-    """
+    def __init__(
+        self,
+        n_components: int,
+        latent_dim: int,
+        ppca: bool = False,
+        lock_psis: bool = False,
+        rs_clip: float = 0.0,
+        max_condition_number: float = 1.0e6,
+        max_iter: int = 100,
+        tol: float = 1.0e-4,
+        random_state: int | np.random.Generator | None = None,
+        verbose: bool = True,
+    ) -> None:
+        if n_components < 1:
+            raise ValueError("n_components must be at least 1.")
+        if latent_dim < 1:
+            raise ValueError("latent_dim must be at least 1.")
+        if rs_clip < 0.0:
+            raise ValueError("rs_clip must be non-negative.")
+        if max_condition_number <= 0.0:
+            raise ValueError("max_condition_number must be positive.")
+        if max_iter < 1:
+            raise ValueError("max_iter must be at least 1.")
+        if tol <= 0.0:
+            raise ValueError("tol must be positive.")
 
-    def __init__(self,
-                 n_components,
-                 latent_dim,
-                 PPCA=False,
-                 lock_psis=False,
-                 rs_clip=0.0,
-                 max_condition_number=1.e6,
-                 maxiter=100,
-                 tol=1e-4,
-                 verbose=True,
-                 ):
-
-        # required
         self.n_components = n_components
-        self.M = latent_dim
-
-        # options
-        self.PPCA = PPCA
+        self.latent_dim = latent_dim
+        self.ppca = ppca
         self.lock_psis = lock_psis
         self.rs_clip = rs_clip
-        self.L_all = list()
-        self.maxiter = maxiter
-        self.tol = tol
-        self.verbose = verbose
         self.max_condition_number = float(max_condition_number)
-        assert rs_clip >= 0.0
+        self.max_iter = max_iter
+        self.tol = tol
+        self.random_state = random_state
+        self.verbose = verbose
 
-        self.N = None
-        self.D = None
-        self.betas = None
-        self.latents = None
-        self.latent_covs = None
-        self.kmeans_rs = None
-        self.rs = None
-        self.logLs = None
-        self.batch_size = None
+        self._rng = self._make_rng(random_state)
+        self._sklearn_random_state = self._make_sklearn_random_state(random_state)
 
-        # member variables used for calculating, e.g., responsibilities
-        self._means = None
-        self._lambdas = None
-        self._covs = None
-        self._inv_covs = None
-        self._psis = None
-        # fixed variables after training. Not used for calculating, e.g., responsibilities
-        self.means = None
-        self.lambdas = None
-        self.covs = None
-        self.inv_covs = None
-        self.psis = None
+        self.lower_bound_history_: list[float] = []
 
+        self.means_: np.ndarray | None = None
+        self.loadings_: np.ndarray | None = None
+        self.covariances_: np.ndarray | None = None
+        self.precisions_: np.ndarray | None = None
+        self.noise_variances_: np.ndarray | None = None
+        self.weights_: np.ndarray | None = None
 
-    def fit(self, data):
-        # covs = low-rank + diagonal cov
-        # empty arrays to be filled
-        self.N = data.shape[0]
-        self.D = data.shape[1]
-        self.rs = np.zeros((self.n_components, self.N))
-        self._covs = np.zeros((self.n_components, self.D, self.D), dtype=complex)
-        self._inv_covs = np.zeros_like(self._covs)
+        self._n_samples: int | None = None
+        self._n_features: int | None = None
+        self._responsibilities: np.ndarray | None = None
+        self._log_likelihoods: np.ndarray | None = None
 
-        # initialize
+    @staticmethod
+    def _make_rng(
+        random_state: int | np.random.Generator | None,
+    ) -> np.random.Generator:
+        """Create a NumPy random generator from a seed or generator."""
+        if isinstance(random_state, np.random.Generator):
+            return random_state
+
+        return np.random.default_rng(random_state)
+
+    @staticmethod
+    def _make_sklearn_random_state(
+        random_state: int | np.random.Generator | None,
+    ) -> int | None:
+        """Create a scikit-learn-compatible random state.
+
+        scikit-learn estimators accept integer seeds but not NumPy Generator
+        instances. If a Generator is provided, draw one deterministic integer
+        seed from it and use that for scikit-learn initialization.
+        """
+        if isinstance(random_state, int):
+            return random_state
+
+        if isinstance(random_state, np.random.Generator):
+            return int(random_state.integers(0, np.iinfo(np.int32).max))
+
+        return None
+
+    @staticmethod
+    def _validate_input_data(data: np.ndarray) -> np.ndarray:
+        """Validate and normalize input data."""
+        data = np.asarray(data)
+
+        if data.ndim != 2:
+            raise ValueError(
+                "data must be a 2D array of shape (n_samples, n_features)."
+            )
+        if data.shape[0] < 1:
+            raise ValueError("data must contain at least one sample.")
+        if data.shape[1] < 1:
+            raise ValueError("data must contain at least one feature.")
+
+        if not np.iscomplexobj(data):
+            data = data.astype(complex)
+
+        if not np.all(np.isfinite(data)):
+            raise ValueError("data must not contain NaN or infinite values.")
+
+        return data
+
+    def _validate_prediction_data(self, data: np.ndarray) -> np.ndarray:
+        """Validate input data for prediction methods."""
+        self._check_is_fitted()
+        data = self._validate_input_data(data)
+
+        if data.shape[1] != self.means_.shape[1]:
+            raise ValueError(
+                "data has incompatible number of features. "
+                f"Expected {self.means_.shape[1]}, got {data.shape[1]}."
+            )
+
+        return data
+
+    def _check_is_fitted(self) -> None:
+        """Raise an error if the model has not been fitted."""
+        if (
+            self.means_ is None
+            or self.loadings_ is None
+            or self.covariances_ is None
+            or self.precisions_ is None
+            or self.noise_variances_ is None
+            or self.weights_ is None
+        ):
+            raise RuntimeError("The model must be fitted before this method is called.")
+
+    def fit(self, data: np.ndarray) -> ComplexMFA:
+        """Fit the complex-valued mixture of factor analyzers.
+
+        Parameters
+        ----------
+        data : ndarray of shape (n_samples, n_features)
+            Complex-valued training data.
+
+        Returns
+        -------
+        self : ComplexMFA
+            Fitted estimator.
+        """
+        data = self._validate_input_data(data)
+
+        self._n_samples, self._n_features = data.shape
+        self._responsibilities = np.zeros((self.n_components, self._n_samples))
+        self.lower_bound_history_ = []
+
         self._initialize(data)
-        # run em algorithm
-        self.run_em(data)
-        # delete unnecessary memory
-        del self.latents, self.latent_covs, self.rs, self.kmeans_rs, self.betas, self.logLs
-        # store fixed parameters
-        self.means = self._means.copy()
-        self.covs = self._covs.copy()
-        self.inv_covs = self._inv_covs.copy()
-        self.psis = self._psis.copy()
-        self.lambdas = self._lambdas.copy()
+        self._run_em(data)
 
+        self._responsibilities = None
+        self._log_likelihoods = None
 
-    def _initialize(self, data):
-        # Run K-means
-        Kmeans = cluster.KMeans(n_clusters=self.n_components, n_init=1,
-                                ).fit(ut.cplx2real(data, axis=1))
-        self._means = ut.real2cplx(Kmeans.cluster_centers_, axis=1)
-        del Kmeans
+        return self
 
-        # Randomly assign factor loadings
-        self._lambdas = (np.random.randn(self.n_components, self.D, self.M) +
-                         1j * np.random.randn(self.n_components, self.D, self.M)) / np.sqrt(
-            self.max_condition_number) / np.sqrt(2)
+    def _initialize(self, data: np.ndarray) -> None:
+        """Initialize mixture parameters."""
+        kmeans = cluster.KMeans(
+            n_clusters=self.n_components,
+            n_init=1,
+            random_state=self._sklearn_random_state,
+        ).fit(ut.cplx2real(data, axis=1))
 
-        # Set (high rank) variance to variance of all data, along a dimension
-        self._psis = np.tile(np.var(data, axis=0)[None, :], (self.n_components, 1))
+        self.means_ = ut.real2cplx(kmeans.cluster_centers_, axis=1)
 
-        # Set initial covs
-        self._update_covs()
+        self.loadings_ = (
+            self._rng.standard_normal(
+                (self.n_components, self._n_features, self.latent_dim)
+            )
+            + 1j
+            * self._rng.standard_normal(
+                (self.n_components, self._n_features, self.latent_dim)
+            )
+        ) / np.sqrt(2.0 * self.max_condition_number)
 
-        # Randomly assign the amplitudes.
-        self.amps = np.random.rand(self.n_components)
-        self.amps /= np.sum(self.amps)
+        initial_noise_variances = np.clip(np.var(data, axis=0), 1.0e-6, np.inf)
 
+        self.noise_variances_ = np.tile(
+            initial_noise_variances[None, :],
+            (self.n_components, 1),
+        )
 
-    def run_em(self, data):
-        """
-        Run the EM algorithm.
-        """
-        L = -np.inf
-        for i in range(self.maxiter):
-            self._EM_per_component(data, self.PPCA)
-            newL = self.logLs.sum()
-            self.L_all.append(newL)
+        self.covariances_ = np.zeros(
+            (self.n_components, self._n_features, self._n_features),
+            dtype=complex,
+        )
+        self.precisions_ = np.zeros_like(self.covariances_)
+
+        self.weights_ = self._rng.random(self.n_components)
+        self.weights_ /= np.sum(self.weights_)
+
+        self._update_covariances()
+
+    def _run_em(self, data: np.ndarray) -> None:
+        """Run the expectation-maximization algorithm."""
+        lower_bound = -np.inf
+        converged = False
+
+        for iteration in range(self.max_iter):
+            self._em_step(data)
+
+            new_lower_bound = float(np.sum(self._log_likelihoods))
+            self.lower_bound_history_.append(new_lower_bound)
+
             if self.verbose:
-                print(f'Iteration {i} | lower bound: {newL:.5f}', end='\r')
-            dL = np.abs((newL - L) / newL)
-            if i > 5 and dL < self.tol:
+                print(
+                    f"Iteration {iteration} | lower bound: {new_lower_bound:.5f}",
+                    end="\r",
+                )
+
+            denominator = max(abs(new_lower_bound), np.finfo(float).eps)
+            relative_change = abs((new_lower_bound - lower_bound) / denominator)
+
+            if iteration > 5 and relative_change < self.tol:
+                converged = True
                 break
-            L = newL
 
-        if i < self.maxiter - 1:
+            lower_bound = new_lower_bound
+
+        if converged:
             if self.verbose:
-                print("EM converged after {0} iterations".format(i))
-                print("Final NLL = {0}".format(-newL))
+                print(f"EM converged after {iteration} iterations")
+                print(f"Final NLL = {-new_lower_bound}")
         else:
-            print("\nWarning: EM didn't converge after {0} iterations"
-                  .format(i))
+            warnings.warn(
+                f"EM did not converge after {self.max_iter} iterations.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
+    def _em_step(self, data: np.ndarray) -> None:
+        """Run one EM update over all mixture components."""
+        self._check_is_fitted()
 
-    def _EM_per_component(self, data, PPCA):
-        # resposibilities and likelihoods
-        self.logLs, self.rs = self._calc_probs(data)
-        sumrs = np.sum(self.rs, axis=1)
+        self._log_likelihoods, self._responsibilities = self._calculate_probabilities(
+            data
+        )
+        responsibility_sums = np.sum(self._responsibilities, axis=1)
+        safe_responsibility_sums = np.maximum(
+            responsibility_sums,
+            np.finfo(float).eps,
+        )
 
-        #pre-compute betas
-        betas = np.transpose(self._lambdas.conj(), [0, 2, 1]) @ self._inv_covs
+        betas = np.transpose(self.loadings_.conj(), [0, 2, 1]) @ self.precisions_
 
-        for k in range(self.n_components):
-            #E-step: Calculation of latents per component
-            # latent values
-            latents = betas[k] @ (data.T - self._means[k, :, None])
+        for component in range(self.n_components):
+            centered_data = data.T - self.means_[component, :, None]
 
-            # latent empirical covariance
-            step1 = latents[:, None, :] * latents[None, :, :].conj()
-            step2 = betas[k] @ self._lambdas[k]
-            latent_covs = np.eye(self.M)[:, :, None] - step2[:, :, None] + step1
+            latents = betas[component] @ centered_data
+            latent_outer_products = latents[:, None, :] * latents[None, :, :].conj()
+            beta_loadings = betas[component] @ self.loadings_[component]
 
-            #M-step: Calculation of new parameters per component
-            lambdalatents = self._lambdas[k] @ latents
-            self._means[k] = np.sum(self.rs[k] * (data.T - lambdalatents), axis=1) / sumrs[k]
-            zeroed = data.T - self._means[k, :, None]
-            self._lambdas[k] = np.dot(np.dot(zeroed[:, None, :] * latents[None, :, :].conj(), self.rs[k]),
-                                      inv(np.dot(latent_covs, self.rs[k])))
-            psis = np.real(np.dot((zeroed - lambdalatents) * zeroed.conj(), self.rs[k]) / sumrs[k])
-            self._psis[k] = np.clip(psis, 1e-6, np.inf)
-            if PPCA:
-                self._psis[k] = np.mean(self._psis[k]) * np.ones(self.D)
-            self.amps[k] = sumrs[k] / data.shape[0]
+            latent_covariances = (
+                np.eye(self.latent_dim)[:, :, None]
+                - beta_loadings[:, :, None]
+                + latent_outer_products
+            )
+
+            loadings_latents = self.loadings_[component] @ latents
+
+            self.means_[component] = (
+                np.sum(
+                    self._responsibilities[component] * (data.T - loadings_latents),
+                    axis=1,
+                )
+                / safe_responsibility_sums[component]
+            )
+
+            zeroed_data = data.T - self.means_[component, :, None]
+
+            weighted_cross_covariance = np.dot(
+                zeroed_data[:, None, :] * latents[None, :, :].conj(),
+                self._responsibilities[component],
+            )
+            weighted_latent_covariance = np.dot(
+                latent_covariances,
+                self._responsibilities[component],
+            )
+
+            self.loadings_[component] = weighted_cross_covariance @ inv(
+                weighted_latent_covariance
+            )
+
+            residual = zeroed_data - loadings_latents
+            noise_variance = np.real(
+                np.dot(
+                    residual * zeroed_data.conj(),
+                    self._responsibilities[component],
+                )
+                / safe_responsibility_sums[component]
+            )
+
+            self.noise_variances_[component] = np.clip(noise_variance, 1.0e-6, np.inf)
+
+            if self.ppca:
+                self.noise_variances_[component] = np.mean(
+                    self.noise_variances_[component]
+                ) * np.ones(self._n_features)
+
+            self.weights_[component] = responsibility_sums[component] / data.shape[0]
 
         if self.lock_psis:
-            psi = np.dot(sumrs, self._psis) / np.sum(sumrs)
-            self._psis = np.full_like(self._psis, psi)
-        self._update_covs()
+            shared_noise_variance = (
+                responsibility_sums @ self.noise_variances_
+            ) / np.sum(responsibility_sums)
 
+            self.noise_variances_ = np.tile(
+                shared_noise_variance[None, :],
+                (self.n_components, 1),
+            )
 
-    def _update_covs(self):
-        """
-        Update self.cov for responsibility, logL calc
-        """
-        self._covs = self._lambdas @ np.transpose(self._lambdas.conj(), [0,2,1])
-        for k in range(self.n_components):
-            self._covs[k] += np.diag(self._psis[k])
-        self._inv_covs = self._invert_cov_all()
+        self._update_covariances()
 
+    def _update_covariances(self) -> None:
+        """Update component covariances and precisions."""
+        self._check_is_fitted()
 
-    def _calc_probs(self, data):
-        """
-        Calculate log likelihoods, responsibilites for each datum
-        under each component.
-        """
-        logrs = np.zeros((self.n_components, self.N))
-        #pre-compute logdets
-        sgn, logdet = np.linalg.slogdet(self._covs)
-        for k in range(self.n_components):
-            logrs[k] = np.log(self.amps[k]) + self._log_multi_gauss_nodet(k, data) - logdet[k]
+        self.covariances_ = self.loadings_ @ np.transpose(
+            self.loadings_.conj(),
+            [0, 2, 1],
+        )
 
-        # here lies some ghetto log-sum-exp...
-        # nothing like a little bit of overflow to make your day better!
-        L = self._log_sum(logrs)
-        logrs -= L[None, :]
+        for component in range(self.n_components):
+            self.covariances_[component] += np.diag(self.noise_variances_[component])
+
+        self.precisions_ = self._invert_covariances()
+
+    def _calculate_probabilities(
+        self,
+        data: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Calculate log likelihoods and component responsibilities."""
+        self._check_is_fitted()
+
+        n_samples = data.shape[0]
+        log_responsibilities = np.zeros((self.n_components, n_samples))
+
+        _, log_determinants = np.linalg.slogdet(self.covariances_)
+
+        for component in range(self.n_components):
+            log_responsibilities[component] = (
+                np.log(self.weights_[component])
+                + self._log_complex_normal_without_logdet(component, data)
+                - np.real(log_determinants[component])
+            )
+
+        log_likelihoods = self._log_sum_exp(log_responsibilities)
+        log_responsibilities -= log_likelihoods[None, :]
+
+        responsibilities = np.exp(log_responsibilities)
+
         if self.rs_clip > 0.0:
-            logrs = np.clip(logrs, np.log(self.rs_clip), np.inf)
-        return L, np.exp(logrs)
+            responsibilities = np.maximum(responsibilities, self.rs_clip)
+            responsibilities /= np.sum(responsibilities, axis=0, keepdims=True)
 
+        return log_likelihoods, responsibilities
 
-    def predict_proba(self, data):
+    def predict_proba(self, data: np.ndarray) -> np.ndarray:
+        """Calculate component responsibilities for each sample.
+
+        Parameters
+        ----------
+        data : ndarray of shape (n_samples, n_features)
+            Complex-valued input data.
+
+        Returns
+        -------
+        responsibilities : ndarray of shape (n_samples, n_components)
+            Posterior component probabilities.
         """
-        Calculate responsibilites.
+        data = self._validate_prediction_data(data)
+
+        log_responsibilities = np.zeros((self.n_components, data.shape[0]))
+
+        for component in range(self.n_components):
+            log_responsibilities[component] = np.log(
+                self.weights_[component]
+            ) + self._log_complex_normal(component, data)
+
+        log_likelihoods = self._log_sum_exp(log_responsibilities)
+        log_responsibilities -= log_likelihoods[None, :]
+
+        return np.exp(log_responsibilities).T
+
+    def predict(self, data: np.ndarray) -> np.ndarray:
+        """Predict the most likely component label for each sample.
+
+        Parameters
+        ----------
+        data : ndarray of shape (n_samples, n_features)
+            Complex-valued input data.
+
+        Returns
+        -------
+        labels : ndarray of shape (n_samples,)
+            Most likely component labels.
         """
-        logrs = np.zeros((self.n_components, data.shape[0]))
-        for k in range(self.n_components):
-            logrs[k] = np.log(self.amps[k]) + self._log_multi_gauss(k, data)
+        return np.argmax(self.predict_proba(data), axis=1)
 
-        # here lies some ghetto log-sum-exp...
-        # nothing like a little bit of overflow to make your day better!
-        L = self._log_sum(logrs)
-        logrs -= L[None, :]
-        # if self.rs_clip > 0.0:
-        #    logrs = np.clip(logrs, np.log(self.rs_clip), np.inf)
-        return np.exp(logrs).T
+    def _log_complex_normal(
+        self,
+        component: int,
+        data: np.ndarray,
+    ) -> np.ndarray:
+        """Calculate complex Gaussian log likelihoods for one component."""
+        _, log_determinant = np.linalg.slogdet(self.covariances_[component])
 
+        centered_data = (data - self.means_[component]).T
+        transformed_data = self.precisions_[component] @ centered_data
+        quadratic_form = np.sum(centered_data.conj() * transformed_data, axis=0)
 
-    def predict_proba_max(self, data):
-        """
-        Calculate label with highest responsibility (argmax).
-        """
-        logrs = np.zeros((self.n_components, data.shape[0]))
-        for k in range(self.n_components):
-            logrs[k] = np.log(self.amps[k]) + self._log_multi_gauss(k, data)
-        return np.exp(logrs).argmax(axis=0)
+        return np.real(
+            -np.log(np.pi) * data.shape[1] - log_determinant - quadratic_form
+        )
 
+    def _log_complex_normal_without_logdet(
+        self,
+        component: int,
+        data: np.ndarray,
+    ) -> np.ndarray:
+        """Calculate complex Gaussian log likelihoods without log determinant."""
+        centered_data = (data - self.means_[component]).T
+        transformed_data = self.precisions_[component] @ centered_data
+        quadratic_form = np.sum(centered_data.conj() * transformed_data, axis=0)
 
-    def _log_multi_gauss(self, k, data):
-        """
-        Gaussian log likelihood of the data for component k.
-        """
-        sgn, logdet = np.linalg.slogdet(self._covs[k])
-        assert sgn > 0
-        X1 = (data - self._means[k]).T
-        X2 = self._inv_covs[k] @ X1
-        p = np.sum(X1.conj() * X2, axis=0)
-        return np.real(- np.log(np.pi) * data.shape[1] - logdet - p)
+        return np.real(-np.log(np.pi) * data.shape[1] - quadratic_form)
 
+    @staticmethod
+    def _log_sum_exp(log_likelihoods: np.ndarray) -> np.ndarray:
+        """Calculate log-sum-exp over components in a numerically stable way."""
+        log_likelihoods = np.atleast_2d(log_likelihoods)
+        max_log_likelihood = np.max(log_likelihoods, axis=0)
 
-    def _log_multi_gauss_nodet(self, k, data):
-        """
-        Gaussian log likelihood of the data for component k without determinant computation.
-        """
-        X1 = (data - self._means[k]).T
-        X2 = self._inv_covs[k] @ X1
-        p = np.sum(X1.conj() * X2, axis=0)
-        return np.real(- np.log(np.pi) * data.shape[1] - p)
+        return max_log_likelihood + np.log(
+            np.sum(
+                np.exp(log_likelihoods - max_log_likelihood[None, :]),
+                axis=0,
+            )
+        )
 
+    def _invert_covariances(self) -> np.ndarray:
+        """Calculate inverse covariances using the Woodbury identity."""
+        self._check_is_fitted()
 
-    def _log_sum(self, loglikes):
-        """
-        Calculate sum of log likelihoods
-        """
-        loglikes = np.atleast_2d(loglikes)
-        a = np.max(loglikes, axis=0)
-        return a + np.log(np.sum(np.exp(loglikes - a[None, :]), axis=0))
+        noise_precisions = 1.0 / self.noise_variances_
 
+        inner = np.linalg.pinv(
+            np.eye(self.latent_dim)[None, :, :]
+            + (
+                np.transpose(self.loadings_.conj(), [0, 2, 1])
+                * noise_precisions[:, None, :]
+            )
+            @ self.loadings_
+        )
 
-    def _invert_cov_all(self):
-        """
-        Calculate inverse covariance of mofa or ppca model,
-        using inversion lemma of all components at once.
-        """
-        psiI = 1 / self._psis
-        inv_inner = np.linalg.pinv(np.eye(self.M)[None, :, :] + (np.transpose(self._lambdas.conj(), [0, 2, 1]) * psiI[:, None, :]) @ self._lambdas)
-        step = psiI[:, :, None] * (self._lambdas @ inv_inner @ np.transpose(self._lambdas.conj(), [0,2,1])) * psiI[:, None, :]
-        for k in range(self.n_components):
-            step[k] -= np.diag(psiI[k])
-        return -step
+        correction = (
+            noise_precisions[:, :, None]
+            * (self.loadings_ @ inner @ np.transpose(self.loadings_.conj(), [0, 2, 1]))
+            * noise_precisions[:, None, :]
+        )
 
+        for component in range(self.n_components):
+            correction[component] -= np.diag(noise_precisions[component])
 
-    def sample(self, n_samples=1, rng=np.random.default_rng()):
-        """Generate random samples from the fitted Gaussian distribution.
+        return -correction
+
+    def sample(
+        self,
+        n_samples: int = 1,
+        rng: np.random.Generator | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Generate random samples from the fitted complex Gaussian mixture.
+
+        Samples are returned grouped by mixture component. The corresponding
+        component labels are returned in the same order.
+
         Parameters
         ----------
         n_samples : int, default=1
             Number of samples to generate.
-        rng: np.random.RandomState instance.
+        rng : numpy.random.Generator, optional
+            Random number generator used for sampling.
+
         Returns
         -------
-        X : array, shape (n_samples, n_features)
-            Randomly generated sample.
-        y : array, shape (nsamples,)
-            Component labels.
+        samples : ndarray of shape (n_samples, n_features)
+            Randomly generated samples.
+        labels : ndarray of shape (n_samples,)
+            Component labels. Labels are grouped by component because samples
+            are generated component-wise.
         """
+        self._check_is_fitted()
 
         if n_samples < 1:
             raise ValueError(
-                "Invalid value for 'n_samples': %d . The sampling requires at "
-                "least one sample." % n_samples
+                "Invalid value for 'n_samples': "
+                f"{n_samples}. Sampling requires at least one sample."
             )
 
-        _, n_features = self.means.shape
         if rng is None:
-            rng = np.random.RandomState(12531616843613)
-        n_samples_comp = rng.multinomial(n_samples, self.amps)
+            rng = np.random.default_rng()
 
-        X = np.vstack(
+        n_samples_per_component = rng.multinomial(n_samples, self.weights_)
+
+        samples = np.vstack(
             [
-                #rng.multivariate_normal(mean, covariance, int(sample))
-                ut.multivariate_normal_cplx(mean, covariances, int(sample))
-                for (mean, covariances, sample) in zip(
-                    self.means, self.covs, n_samples_comp
+                ut.multivariate_normal_cplx(
+                    mean,
+                    covariance,
+                    int(component_samples),
+                    rng=rng,
                 )
+                for mean, covariance, component_samples in zip(
+                    self.means_,
+                    self.covariances_,
+                    n_samples_per_component,
+                    strict=True,
+                )
+                if component_samples > 0
             ]
         )
 
-
-        y = np.concatenate(
-            [np.full(sample, j, dtype=int) for j, sample in enumerate(n_samples_comp)]
+        labels = np.concatenate(
+            [
+                np.full(component_samples, component, dtype=int)
+                for component, component_samples in enumerate(n_samples_per_component)
+                if component_samples > 0
+            ]
         )
 
-        return (X, y)
+        return samples, labels
