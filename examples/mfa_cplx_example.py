@@ -3,7 +3,7 @@
 
 import time
 import numpy as np
-import MFA_cplx
+from cplx_mfa import ComplexMFA
 
 
 if __name__ == '__main__':
@@ -29,13 +29,13 @@ if __name__ == '__main__':
     # MFA training
     #
     tic = time.time()
-    mfa_est = MFA_cplx.MFA_cplx(
+    mfa_est = ComplexMFA(
         n_components=16,
         latent_dim=12,
         PPCA=PPCA,
         lock_psis=lock_psis,
         rs_clip=1e-6,
-        max_condition_number=1.e6,
+        max_condition_number=1.0e6,
         maxiter=100,
         verbose=False,
     )
