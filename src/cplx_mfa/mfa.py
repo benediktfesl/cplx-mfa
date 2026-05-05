@@ -9,10 +9,10 @@
 import numpy as np
 from scipy.linalg import inv
 from sklearn import cluster
-import utils as ut
+from . import utils as ut
 
 
-class MFA_cplx(object):
+class ComplexMFA:
     """
     Complex-valued implementation of the EM algorithm for fitting Mixture of Factor Analyzers.
 
@@ -184,7 +184,7 @@ class MFA_cplx(object):
             self._lambdas[k] = np.dot(np.dot(zeroed[:, None, :] * latents[None, :, :].conj(), self.rs[k]),
                                       inv(np.dot(latent_covs, self.rs[k])))
             psis = np.real(np.dot((zeroed - lambdalatents) * zeroed.conj(), self.rs[k]) / sumrs[k])
-            self._psis[k] = np.clip(psis, 1e-6, np.Inf)
+            self._psis[k] = np.clip(psis, 1e-6, np.inf)
             if PPCA:
                 self._psis[k] = np.mean(self._psis[k]) * np.ones(self.D)
             self.amps[k] = sumrs[k] / data.shape[0]
@@ -221,7 +221,7 @@ class MFA_cplx(object):
         L = self._log_sum(logrs)
         logrs -= L[None, :]
         if self.rs_clip > 0.0:
-            logrs = np.clip(logrs, np.log(self.rs_clip), np.Inf)
+            logrs = np.clip(logrs, np.log(self.rs_clip), np.inf)
         return L, np.exp(logrs)
 
 
@@ -238,7 +238,7 @@ class MFA_cplx(object):
         L = self._log_sum(logrs)
         logrs -= L[None, :]
         # if self.rs_clip > 0.0:
-        #    logrs = np.clip(logrs, np.log(self.rs_clip), np.Inf)
+        #    logrs = np.clip(logrs, np.log(self.rs_clip), np.inf)
         return np.exp(logrs).T
 
 
