@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Complex-valued mixture of factor analyzers with a scikit-learn-like API."
 readme = "README.md"
 license = "BSD-3-Clause"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.23",

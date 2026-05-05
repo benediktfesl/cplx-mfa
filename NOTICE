@@ -1,0 +1,9 @@
+This package contains code derived from the original mofa implementation.
+
+Original code base:
+Authors: Ross Fadely, Daniel Foreman-Mackey, David W. Hogg, and contributors.
+License: MIT
+
+Modifications and complex-valued extension:
+Author: Benedikt Fesl
+License: BSD-3-Clause
