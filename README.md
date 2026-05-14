@@ -18,6 +18,7 @@ Parts of the implementation are derived from the original [`mofa`](https://pypi.
 - scikit-learn-like estimator API with `fit`, `predict`, `predict_proba`, and `sample`
 - Optional isotropic PPCA-style noise model
 - Optional shared diagonal noise variances across components
+- Optional zero-mean component constraint
 - Sampling from fitted complex-valued MFA models
 - Fitted parameters exposed with trailing-underscore names
 - Modern Python packaging with `pyproject.toml`, `uv`, `pytest`, and `ruff`
@@ -32,13 +33,13 @@ If you use `cplx-mfa` in academic work, please cite the package directly:
   title = {{cplx-mfa}: Complex-valued mixture of factor analyzers},
   year = {2026},
   url = {https://github.com/benediktfesl/cplx-mfa},
-  version = {0.1.0}
+  version = {0.1.1}
 }
 ```
 
 Plain-text citation:
 
-> B. Fesl, `cplx-mfa`: Complex-valued mixture of factor analyzers, version 0.1.0. Available: https://github.com/benediktfesl/cplx-mfa
+> B. Fesl, `cplx-mfa`: Complex-valued mixture of factor analyzers, version 0.1.1. Available: https://github.com/benediktfesl/cplx-mfa
 
 ## 📦 Installation
 
@@ -144,6 +145,7 @@ Constructor parameters:
 | `latent_dim` | Latent dimensionality of each factor analyzer. |
 | `ppca` | If `True`, use one isotropic noise variance per component. |
 | `lock_psis` | If `True`, use shared diagonal noise variances across components. |
+| `zero_mean` | If `True`, enforce zero component means during initialization and EM. |
 | `rs_clip` | Lower clipping value for responsibilities during EM. |
 | `max_condition_number` | Scaling factor used for random loading initialization. |
 | `max_iter` | Maximum number of EM iterations. |
@@ -197,6 +199,23 @@ model.fit(X)
 ```
 
 This can be useful when all mixture components are expected to share the same residual noise floor.
+
+## 🎯 Zero-Mean Components
+
+Set `zero_mean=True` to enforce zero means for all mixture components:
+
+```python
+model = ComplexMFA(
+    n_components=4,
+    latent_dim=2,
+    zero_mean=True,
+    random_state=0,
+)
+
+model.fit(X)
+```
+
+This is useful when the data is known or assumed to be zero-mean and only the component covariance structure should be learned.
 
 ## 📚 Research Background
 

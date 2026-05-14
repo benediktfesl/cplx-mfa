@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cplx-mfa"
-version = "0.1.0"
+version = "0.1.1"
 description = "Complex-valued mixture of factor analyzers with a scikit-learn-like API."
 readme = "README.md"
 license = "BSD-3-Clause"

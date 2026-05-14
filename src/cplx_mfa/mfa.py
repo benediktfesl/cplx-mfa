@@ -24,6 +24,8 @@ class ComplexMFA:
         If True, use an isotropic diagonal covariance per component.
     lock_psis : bool, default=False
         If True, use a shared diagonal covariance across components.
+    zero_mean : bool, default=False
+        If True, enforce zero component means during initialization and EM.
     rs_clip : float, default=0.0
         Lower clipping value for responsibilities during EM.
     max_condition_number : float, default=1e6
@@ -61,6 +63,7 @@ class ComplexMFA:
         latent_dim: int,
         ppca: bool = False,
         lock_psis: bool = False,
+        zero_mean: bool = False,
         rs_clip: float = 0.0,
         max_condition_number: float = 1.0e6,
         max_iter: int = 100,
@@ -85,6 +88,7 @@ class ComplexMFA:
         self.latent_dim = latent_dim
         self.ppca = ppca
         self.lock_psis = lock_psis
+        self.zero_mean = zero_mean
         self.rs_clip = rs_clip
         self.max_condition_number = float(max_condition_number)
         self.max_iter = max_iter
@@ -213,13 +217,16 @@ class ComplexMFA:
 
     def _initialize(self, data: np.ndarray) -> None:
         """Initialize mixture parameters."""
-        kmeans = cluster.KMeans(
-            n_clusters=self.n_components,
-            n_init=1,
-            random_state=self._sklearn_random_state,
-        ).fit(ut.cplx2real(data, axis=1))
+        if self.zero_mean:
+            self.means_ = np.zeros((self.n_components, self._n_features), dtype=complex)
+        else:
+            kmeans = cluster.KMeans(
+                n_clusters=self.n_components,
+                n_init=1,
+                random_state=self._sklearn_random_state,
+            ).fit(ut.cplx2real(data, axis=1))
 
-        self.means_ = ut.real2cplx(kmeans.cluster_centers_, axis=1)
+            self.means_ = ut.real2cplx(kmeans.cluster_centers_, axis=1)
 
         self.loadings_ = (
             self._rng.standard_normal(
@@ -316,13 +323,16 @@ class ComplexMFA:
 
             loadings_latents = self.loadings_[component] @ latents
 
-            self.means_[component] = (
-                np.sum(
-                    self._responsibilities[component] * (data.T - loadings_latents),
-                    axis=1,
+            if self.zero_mean:
+                self.means_[component] = np.zeros(self._n_features, dtype=complex)
+            else:
+                self.means_[component] = (
+                    np.sum(
+                        self._responsibilities[component] * (data.T - loadings_latents),
+                        axis=1,
+                    )
+                    / safe_responsibility_sums[component]
                 )
-                / safe_responsibility_sums[component]
-            )
 
             zeroed_data = data.T - self.means_[component, :, None]
 
